@@ -1129,6 +1129,124 @@ static void esb_ack_handler_cb(
 	}
 }
 
+// Print a calibration status report (ESB_CAL_STATUS_TYPE) from a tracker on the
+// receiver's serial console. Uses deferred logging since event_handler runs in
+// ESB event context.
+static void esb_print_cal_status(const uint8_t *data)
+{
+	uint8_t tracker_id = data[1];
+	uint8_t kind = data[2];
+	uint8_t phase = data[3];
+	uint8_t axis = data[4];
+	uint8_t detail = data[5];
+	float value1, value2;
+	memcpy(&value1, &data[6], sizeof(value1));
+	memcpy(&value2, &data[10], sizeof(value2));
+	char axis_char = (axis < 3) ? "XYZ"[axis] : '?';
+
+	if (kind != CAL_STATUS_KIND_SENS_AUTO) {
+		LOG_INF(
+			"TRK %u cal: unknown report (kind 0x%02X, phase 0x%02X, %.4f, %.4f)",
+			tracker_id, kind, phase, (double)value1, (double)value2
+		);
+		return;
+	}
+
+	switch (phase) {
+	case CAL_STATUS_PHASE_STARTED:
+		LOG_INF(
+			"TRK %u cal: sens auto-cal started, %c axis, %.0f rev (%.0f deg) - hold still",
+			tracker_id, axis_char, (double)value2, (double)value1
+		);
+		break;
+	case CAL_STATUS_PHASE_BIAS:
+		LOG_INF(
+			"TRK %u cal: bias measured (%.4f dps) - spin %c axis now",
+			tracker_id, (double)value1, axis_char
+		);
+		break;
+	case CAL_STATUS_PHASE_RECORDING:
+		LOG_INF(
+			"TRK %u cal: spin detected (%.1f dps), recording",
+			tracker_id, (double)value1
+		);
+		break;
+	case CAL_STATUS_PHASE_DONE:
+		LOG_INF(
+			"TRK %u cal: DONE - measured %.2f deg, %c axis scale %.5f applied%s",
+			tracker_id, (double)value1, axis_char, (double)value2,
+			detail ? " (axis alignment was loose; repeating may improve accuracy)" : ""
+		);
+		break;
+	case CAL_STATUS_PHASE_REJECTED:
+		switch (detail) {
+		case CAL_STATUS_REJECT_OFF_AXIS:
+			LOG_WRN(
+				"TRK %u cal: REJECTED - too much off-axis motion (ratio %.2f), not applied",
+				tracker_id, (double)value1
+			);
+			break;
+		case CAL_STATUS_REJECT_NON_FINITE:
+			LOG_WRN(
+				"TRK %u cal: REJECTED - invalid scale (measured %.2f deg), not applied",
+				tracker_id, (double)value1
+			);
+			break;
+		case CAL_STATUS_REJECT_SCALE_RANGE:
+		default:
+			LOG_WRN(
+				"TRK %u cal: REJECTED - scale %.5f out of range (measured %.2f deg), not applied",
+				tracker_id, (double)value2, (double)value1
+			);
+			break;
+		}
+		break;
+	case CAL_STATUS_PHASE_ABORTED: {
+		const char *reason;
+		switch (detail) {
+		case CAL_STATUS_ABORT_NOT_STILL:
+			reason = "tracker not held still";
+			break;
+		case CAL_STATUS_ABORT_GYRO_TIMEOUT:
+			reason = "gyro timeout";
+			break;
+		case CAL_STATUS_ABORT_NO_SPIN:
+			reason = "no spin detected";
+			break;
+		case CAL_STATUS_ABORT_SPIN_TIMEOUT:
+			reason = "spin did not complete in time";
+			break;
+		case CAL_STATUS_ABORT_ANGLE_SMALL:
+			reason = "measured angle too small";
+			break;
+		case CAL_STATUS_ABORT_NO_STORAGE:
+			reason = "tracker storage unavailable";
+			break;
+		case CAL_STATUS_ABORT_BAD_PARAMS:
+			reason = "invalid parameters";
+			break;
+		default:
+			reason = "unknown reason";
+			break;
+		}
+		if (value1 != 0.0f) {
+			LOG_WRN(
+				"TRK %u cal: ABORTED - %s (%.2f deg measured)",
+				tracker_id, reason, (double)value1
+			);
+		} else {
+			LOG_WRN("TRK %u cal: ABORTED - %s", tracker_id, reason);
+		}
+	} break;
+	default:
+		LOG_INF(
+			"TRK %u cal: unknown phase 0x%02X (%.4f, %.4f)",
+			tracker_id, phase, (double)value1, (double)value2
+		);
+		break;
+	}
+}
+
 void event_handler(struct esb_evt const *event)
 {
 	switch (event->evt_id) {
@@ -1655,6 +1773,14 @@ void event_handler(struct esb_evt const *event)
 				if (seq_result == 2) {
 					LOG_DBG("TRK %d: Out-of-order packet seq=%d, dropped", tracker_id, received_sequence);
 					// Drop out-of-order packet to avoid incorrect pose calculation
+					break;
+				}
+
+				// Calibration status report from tracker: print to the serial
+				// console and do not forward to the HID endpoint (the SlimeVR
+				// server does not consume this packet type).
+				if (rx_payload.data[0] == ESB_CAL_STATUS_TYPE) {
+					esb_print_cal_status(rx_payload.data);
 					break;
 				}
 
